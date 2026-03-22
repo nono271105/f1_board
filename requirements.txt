@@ -1,0 +1,21 @@
+# Core Framework
+PyQt5
+PyQtWebEngine
+
+# Data Analysis & F1
+fastf1
+pandas
+numpy
+
+# Visualization
+plotly
+kaleido
+matplotlib
+seaborn
+
+# Additional utilities
+requests
+python-dateutil
+
+# Optional
+pyarrow
