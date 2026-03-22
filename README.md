@@ -1,6 +1,6 @@
 # F1 Dashboard
 
-Application desktop de visualisation de données Formula 1, construite avec PyQt5 et FastF1.
+Application desktop de visualisation de données Formula 1.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt5](https://img.shields.io/badge/PyQt5-5.15+-green) ![FastF1](https://img.shields.io/badge/FastF1-3.x-red)
 
@@ -14,7 +14,7 @@ Application desktop de visualisation de données Formula 1, construite avec PyQt
   - Stratégie pneus (stints par pilote)
   - Comparaison du rythme des équipes (boxplot)
   - Progression des temps au tour par pilote (sélection libre)
-- **Saisons 2018 à 2026** supportées
+- **Saisons 2018 à 2025** supportées
 - **Cache mémoire** : une session chargée n'est jamais rechargée dans la même session d'app
 - **Cache disque FastF1** : les données téléchargées sont persistées entre les lancements
 - **UI non-bloquante** : tous les chargements tournent dans un `QThreadPool`, l'interface reste réactive
