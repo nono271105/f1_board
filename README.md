@@ -8,16 +8,20 @@ Application desktop de visualisation de données Formula 1.
 
 ## Fonctionnalités
 
-- **5 visualisations** disponibles pour chaque Grand Prix
-  - Distribution des temps au tour (violon + swarm par compound)
-  - Évolution des positions pendant la course
-  - Stratégie pneus (stints par pilote)
-  - Comparaison du rythme des équipes (boxplot)
-  - Progression des temps au tour par pilote (sélection libre)
-- **Saisons 2018 à 2025** supportées
-- **Cache mémoire** : une session chargée n'est jamais rechargée dans la même session d'app
-- **Cache disque FastF1** : les données téléchargées sont persistées entre les lancements
-- **UI non-bloquante** : tous les chargements tournent dans un `QThreadPool`, l'interface reste réactive
+- **7 visualisations télémétriques et stratégiques** :
+  - 🏎️ Distribution des temps au tour (violon + swarm par compound Pirelli)
+  - 📈 Évolution des positions en course (dynamique 20 à 22 pilotes)
+  - 🛞 Stratégie pneumatique (relais et gommes officielles)
+  - ⏱️ Comparaison du rythme des écuries (box plot avec médianes or)
+  - 📊 Progression des temps au tour par pilote
+  - ⚡ Comparaison de télémétrie des tours rapides (vitesse, accélérateur, frein)
+  - 🏁 Évolution de l'écart chronométrique au leader (Gap to leader)
+- **Bandeau de métriques de course en direct** : Vainqueur, tour le plus rapide, distance de course et météo de piste.
+- **Support des saisons 2018 à 2026+** avec compatibilité pour les nouvelles écuries (Audi, Cadillac).
+- **Sélecteur de type de session** : Course (GP), Qualifications (Q), Sprint (S), Shootout (SQ) et Essais libres (FP1/2/3).
+- **Barre d'outils interactive sombre** : Zoom rectangulaire, déplacement (pan), réinitialisation de la vue.
+- **Export haute résolution** : Sauvegarde en formats PNG (300 DPI), PDF ou SVG.
+- **Double cache haute performance** : Cache disque persistant FastF1 et cache mémoire applicatif.
 
 ---
 

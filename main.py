@@ -1,60 +1,67 @@
 """
-F1 Dashboard — Entry point
+main.py — Point d'entrée de l'application F1 Dashboard
 """
 
 import sys
 import logging
 from pathlib import Path
 
-# ── FastF1 cache (doit être fait avant tout import fastf1) ──────────────────
+# ── Configuration du cache FastF1 (avant tout appel fastf1) ───────────────────
 import fastf1
 _CACHE_DIR = Path(__file__).parent / "cache"
 _CACHE_DIR.mkdir(exist_ok=True)
-fastf1.Cache.enable_cache(str(_CACHE_DIR))
+try:
+    fastf1.Cache.enable_cache(str(_CACHE_DIR))
+except Exception as exc:
+    # Mode fallback si enable_cache a été appelé
+    pass
 
-# ── Matplotlib backend Qt5 ──────────────────────────────────────────────────
+# ── Backend Matplotlib Qt5 ────────────────────────────────────────────────────
 import matplotlib
 matplotlib.use("Qt5Agg")
 
-# ── Logging ─────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 _LOG_DIR = Path(__file__).parent / "logs"
 _LOG_DIR.mkdir(exist_ok=True)
 
 _fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 
-# Console : INFO uniquement (pas de DEBUG)
 _console = logging.StreamHandler(sys.stdout)
 _console.setLevel(logging.INFO)
 _console.setFormatter(_fmt)
 
-# Fichier : tout en DEBUG pour le diagnostic
-_file = logging.FileHandler(_LOG_DIR / "f1_dashboard.log")
+_file = logging.FileHandler(_LOG_DIR / "f1_dashboard.log", encoding="utf-8")
 _file.setLevel(logging.DEBUG)
 _file.setFormatter(_fmt)
 
-# Logger racine
 logging.getLogger().setLevel(logging.DEBUG)
 logging.getLogger().addHandler(_console)
 logging.getLogger().addHandler(_file)
 
-# Silencer les loggers externes verbeux
 for _noisy in ("matplotlib", "matplotlib.font_manager", "fastf1", "urllib3", "requests"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("main")
 
 
 def main() -> None:
+    from PyQt5.QtCore import Qt
     from PyQt5.QtWidgets import QApplication
     from gui import MainWindow
 
-    log.info("Démarrage F1 Dashboard")
+    # Support haute résolution (Retina / High-DPI)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    log.info("Démarrage de F1 Dashboard Analytics")
     app = QApplication(sys.argv)
     app.setApplicationName("F1 Dashboard")
+    app.setApplicationDisplayName("F1 Analytics Dashboard")
 
     window = MainWindow()
     window.show()
 
-    log.info("Fenêtre affichée")
+    log.info("Interface F1 Dashboard affichée avec succès")
     sys.exit(app.exec_())
 
 
