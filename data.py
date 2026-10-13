@@ -1,314 +1,408 @@
 """
-data.py — Couche données F1
+data.py : couche données (aucune dépendance à Qt).
 
-Responsabilités :
-- Accès FastF1 (calendrier, sessions, pilotes)
-- Support multi-saisons dynamique (2018 jusqu'à l'année en cours + 1)
-- Cache mémoire et gestion des sessions asynchrones via QThreadPool
-- Extraction de métriques de résumé de session (vainqueur, tour rapide, météo)
+- Service : accès FastF1 (calendrier, sessions, télémétrie) avec cache mémoire.
+- SessionData : copie normalisée et légère d'une session (DataFrames pandas simples),
+  pour que les graphiques ne dépendent jamais directement de FastF1.
+- Les fonctions build_* sont pures : on peut les tester avec des données synthétiques.
 """
 
 from __future__ import annotations
 
-import datetime
+import datetime as dt
 import logging
-from typing import Optional, Any
+import threading
+import zlib
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-import fastf1
+import numpy as np
 import pandas as pd
-from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal, pyqtSlot
-
-import charts
 
 log = logging.getLogger(__name__)
 
-# ── Saisons disponibles (dynamique) ──────────────────────────────────────────
+FIRST_SEASON = 2018
 
-_NOW_YEAR = datetime.date.today().year
-AVAILABLE_YEARS: list[int] = list(range(2018, max(2027, _NOW_YEAR + 1)))
-
-SESSION_TYPES: dict[str, str] = {
-    "R":   "Course (Grand Prix)",
-    "Q":   "Qualifications",
-    "S":   "Course Sprint",
-    "SQ":  "Qualifications Sprint",
-    "FP1": "Essais Libres 1 (FP1)",
-    "FP2": "Essais Libres 2 (FP2)",
-    "FP3": "Essais Libres 3 (FP3)",
+SESSION_LABELS = {
+    "R": "Course",
+    "Q": "Qualifications",
+    "S": "Course sprint",
+    "SQ": "Qualifications sprint",
+    "FP1": "Essais libres 1",
+    "FP2": "Essais libres 2",
+    "FP3": "Essais libres 3",
+}
+SESSION_SHORT = {
+    "R": "Course", "Q": "Qualifs", "S": "Sprint", "SQ": "Q. sprint",
+    "FP1": "EL1", "FP2": "EL2", "FP3": "EL3",
+}
+SESSION_ORDER = ["FP1", "FP2", "FP3", "SQ", "S", "Q", "R"]
+_NAME_TO_CODE = {
+    "Practice 1": "FP1", "Practice 2": "FP2", "Practice 3": "FP3",
+    "Qualifying": "Q", "Sprint Qualifying": "SQ", "Sprint Shootout": "SQ",
+    "Sprint": "S", "Race": "R",
 }
 
-
-# ── Signals wrapper ───────────────────────────────────────────────────────────
-
-class _WorkerSignals(QObject):
-    result = pyqtSignal(object)
-    error  = pyqtSignal(str)
+_FALLBACK_COLORS = [
+    "#3671c6", "#27f4d2", "#e8002d", "#ff8000", "#229971", "#ff87bc",
+    "#64c4ff", "#b6babd", "#6692ff", "#52e252", "#d4af37", "#b138dd",
+]
 
 
-# ── Worker générique ─────────────────────────────────────────────────────────
-
-class _Worker(QRunnable):
-    """Exécute une fonction dans le pool global sans bloquer le thread principal."""
-
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self.fn      = fn
-        self.args    = args
-        self.kwargs  = kwargs
-        self.signals = _WorkerSignals()
-        self.setAutoDelete(True)
-
-    @pyqtSlot()
-    def run(self) -> None:
-        try:
-            result = self.fn(*self.args, **self.kwargs)
-            try:
-                self.signals.result.emit(result)
-            except RuntimeError:
-                pass
-        except Exception as exc:
-            log.error("Erreur worker (%s): %s", self.fn.__name__, exc, exc_info=True)
-            try:
-                self.signals.error.emit(str(exc))
-            except RuntimeError:
-                pass
+class DataUnavailable(Exception):
+    """Données absentes ou pas encore publiées : le message est affiché tel quel."""
 
 
-# ── Extraction des métriques de session ──────────────────────────────────────
+def available_years() -> list[int]:
+    """Saisons proposées, de la plus récente à 2018 (la nouvelle saison apparaît en novembre)."""
+    today = dt.date.today()
+    return list(range(today.year + (1 if today.month >= 11 else 0), FIRST_SEASON - 1, -1))
 
-def extract_session_metrics(session: fastf1.core.Session) -> dict[str, Any]:
-    """Extrait les métriques clés d'une session pour affichage dans le bandeau."""
-    metrics: dict[str, Any] = {
-        "event_name": str(session.event.get("EventName", "Grand Prix")),
-        "year": int(session.event.year),
-        "session_name": str(session.name),
-        "winner": "—",
-        "winner_team": "—",
-        "fastest_driver": "—",
-        "fastest_time": "—",
-        "total_laps": 0,
-        "drivers_count": len(session.drivers),
-        "air_temp": None,
-        "track_temp": None,
+
+# ── Modèles ──────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Event:
+    round: int
+    name: str
+    country: str
+    location: str
+    date: dt.date
+    sessions: tuple[str, ...]
+
+    @property
+    def short(self) -> str:
+        return self.name.replace(" Grand Prix", "").strip()
+
+    @property
+    def done(self) -> bool:
+        return self.date <= dt.date.today()
+
+
+@dataclass(frozen=True)
+class Driver:
+    code: str
+    name: str
+    team: str
+    number: str
+    color: str
+    dashed: bool          # second pilote d'une écurie : trait en tirets pour les distinguer
+    position: Optional[int]
+    grid: Optional[int]
+
+
+@dataclass
+class TelemetryLap:
+    code: str
+    laptime_s: float
+    df: pd.DataFrame      # colonnes : dist, speed, throttle, brake, gear, t
+
+
+@dataclass
+class SessionData:
+    year: int
+    event: Event
+    code: str
+    drivers: list[Driver]
+    laps: pd.DataFrame
+    metrics: dict
+    _ff1: object = field(default=None, repr=False)
+    _tel_loaded: bool = field(default=False, repr=False)
+    _tel: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def label(self) -> str:
+        return SESSION_LABELS.get(self.code, self.code)
+
+    @property
+    def is_race(self) -> bool:
+        return self.code in ("R", "S")
+
+    @property
+    def codes(self) -> list[str]:
+        return [d.code for d in self.drivers]
+
+    def has_telemetry(self, codes: list[str]) -> bool:
+        return all(c in self._tel for c in codes)
+
+    def driver(self, code: str) -> Driver:
+        for d in self.drivers:
+            if d.code == code:
+                return d
+        raise KeyError(code)
+
+
+# ── Utilitaires ──────────────────────────────────────────────────────────────
+
+def fmt_time(sec: float) -> str:
+    """92.345 -> 1:32.345"""
+    if sec is None or not np.isfinite(sec):
+        return "n/d"
+    m, s = divmod(float(sec), 60)
+    return f"{int(m)}:{s:06.3f}" if m >= 1 else f"{s:.3f}"
+
+
+def _luminance(hex_color: str) -> float:
+    r, g, b = (int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _lighten(hex_color: str, t: float) -> str:
+    ch = [int(hex_color[i:i + 2], 16) for i in (1, 3, 5)]
+    ch = [round(c + (255 - c) * t) for c in ch]
+    return "#{:02x}{:02x}{:02x}".format(*ch)
+
+
+def _team_color(raw_hex, team: str) -> str:
+    """Couleur d'écurie fournie par FastF1 (sans '#'), sinon repli stable (pas de hash() aléatoire)."""
+    h = str(raw_hex or "").strip().lstrip("#")
+    if len(h) == 6 and all(c in "0123456789abcdefABCDEF" for c in h):
+        color = "#" + h.lower()
+    else:
+        color = _FALLBACK_COLORS[zlib.crc32(team.encode()) % len(_FALLBACK_COLORS)]
+    if _luminance(color) < 0.10:            # quasi noir : éclaircir pour rester lisible sur fond sombre
+        color = _lighten(color, 0.45)
+    return color
+
+
+def _col(raw: pd.DataFrame, name: str, default=np.nan) -> pd.Series:
+    if name in raw.columns:
+        return raw[name]
+    return pd.Series(default, index=raw.index)
+
+
+def _seconds(s: pd.Series) -> pd.Series:
+    return pd.to_timedelta(s, errors="coerce").dt.total_seconds()
+
+
+# ── Normalisation (fonctions pures) ──────────────────────────────────────────
+
+def normalize_laps(raw: pd.DataFrame) -> pd.DataFrame:
+    raw = pd.DataFrame(raw).reset_index(drop=True)
+    compound = _col(raw, "Compound", "UNKNOWN").astype(str).str.upper()
+    compound = compound.replace({"NAN": "UNKNOWN", "NONE": "UNKNOWN", "": "UNKNOWN"})
+    df = pd.DataFrame({
+        "driver": _col(raw, "Driver", "").astype(str),
+        "team": _col(raw, "Team", "").astype(str),
+        "lap": pd.to_numeric(_col(raw, "LapNumber"), errors="coerce"),
+        "time_s": _seconds(_col(raw, "Time", pd.NaT)),
+        "laptime_s": _seconds(_col(raw, "LapTime", pd.NaT)),
+        "position": pd.to_numeric(_col(raw, "Position"), errors="coerce"),
+        "stint": pd.to_numeric(_col(raw, "Stint"), errors="coerce"),
+        "compound": compound,
+        "pit": _col(raw, "PitInTime", pd.NaT).notna() | _col(raw, "PitOutTime", pd.NaT).notna(),
+        "deleted": _col(raw, "Deleted", False).map(lambda v: bool(v) if pd.notna(v) else False),
+    })
+    df = df[(df["driver"] != "") & df["lap"].notna()].copy()
+    df["lap"] = df["lap"].astype(int)
+    df["stint"] = (
+        df.groupby("driver")["stint"].transform(lambda s: s.ffill().bfill()).fillna(1).astype(int)
+    )
+    return df.sort_values(["driver", "lap"]).reset_index(drop=True)
+
+
+def build_drivers(results: Optional[pd.DataFrame], laps: pd.DataFrame) -> list[Driver]:
+    best = laps.groupby("driver")["laptime_s"].min()
+    with_laps = set(laps["driver"].unique())
+    rows = []
+
+    if results is not None and len(results):
+        for _, r in results.iterrows():
+            code = str(r.get("Abbreviation", "")).strip()
+            if code in with_laps:
+                rows.append({
+                    "code": code,
+                    "name": str(r.get("FullName") or code),
+                    "team": str(r.get("TeamName") or ""),
+                    "number": str(r.get("DriverNumber") or ""),
+                    "hex": r.get("TeamColor"),
+                    "pos": pd.to_numeric(r.get("Position"), errors="coerce"),
+                    "grid": pd.to_numeric(r.get("GridPosition"), errors="coerce"),
+                })
+    known = {r["code"] for r in rows}
+    for code in sorted(with_laps - known):                  # pilotes absents des résultats
+        team = laps.loc[laps["driver"] == code, "team"].iloc[0]
+        rows.append({"code": code, "name": code, "team": team, "number": "",
+                     "hex": None, "pos": np.nan, "grid": np.nan})
+
+    # Classement : position officielle si connue, sinon meilleur tour (essais libres)
+    rank_by_lap = best.rank(method="first")
+    for r in rows:
+        r["key"] = r["pos"] if pd.notna(r["pos"]) else 1000 + rank_by_lap.get(r["code"], 999)
+    rows.sort(key=lambda r: r["key"])
+
+    seen: dict[str, int] = {}
+    drivers = []
+    for r in rows:
+        n = seen.get(r["team"], 0)
+        seen[r["team"]] = n + 1
+        drivers.append(Driver(
+            code=r["code"], name=r["name"], team=r["team"], number=r["number"],
+            color=_team_color(r["hex"], r["team"]), dashed=n >= 1,
+            position=int(r["pos"]) if pd.notna(r["pos"]) else None,
+            grid=int(r["grid"]) if pd.notna(r["grid"]) and r["grid"] > 0 else None,
+        ))
+    return drivers
+
+
+def build_metrics(code: str, drivers: list[Driver], laps: pd.DataFrame,
+                  weather: Optional[pd.DataFrame]) -> dict:
+    lead = drivers[0] if drivers else None
+    lead_label = {"R": "Vainqueur", "S": "Vainqueur", "Q": "Pole position", "SQ": "Pole position"}.get(
+        code, "Meilleur temps")
+    if code.startswith("FP") and len(laps):          # essais : le plus rapide, pas un classement
+        idx = laps.loc[~laps["deleted"], "laptime_s"].idxmin() if laps["laptime_s"].notna().any() else None
+        if idx is not None:
+            lead = next((d for d in drivers if d.code == laps.loc[idx, "driver"]), lead)
+
+    valid = laps[laps["laptime_s"].notna() & ~laps["deleted"]]
+    fastest = valid.loc[valid["laptime_s"].idxmin()] if len(valid) else None
+
+    m = {
+        "lead_label": lead_label,
+        "lead_code": lead.code if lead else "n/d",
+        "lead_name": lead.name if lead else "n/d",
+        "lead_team": lead.team if lead else "",
+        "lead_color": lead.color if lead else "#6d6e77",
+        "fastest_code": str(fastest["driver"]) if fastest is not None else "n/d",
+        "fastest_time": fmt_time(fastest["laptime_s"]) if fastest is not None else "n/d",
+        "laps": int(laps["lap"].max()) if len(laps) else 0,
+        "air": None, "track": None, "rain": False,
     }
-
-    try:
-        if hasattr(session, "results") and not session.results.empty:
-            first = session.results.iloc[0]
-            metrics["winner"] = str(first.get("FullName") or first.get("Abbreviation", "—"))
-            metrics["winner_team"] = str(first.get("TeamName", "—"))
-    except Exception as exc:
-        log.debug("Impossible d'extraire le vainqueur: %s", exc)
-
-    try:
-        if hasattr(session, "laps") and not session.laps.empty:
-            metrics["total_laps"] = int(session.laps["LapNumber"].max())
-            quick = session.laps.pick_fastest()
-            if quick is not None and not pd.isna(quick.get("LapTime")):
-                time_str = str(quick["LapTime"]).split()[-1][:11]
-                metrics["fastest_driver"] = str(quick.get("Driver", "—"))
-                metrics["fastest_time"] = time_str
-    except Exception as exc:
-        log.debug("Impossible d'extraire le tour rapide: %s", exc)
-
-    try:
-        if hasattr(session, "weather_data") and not session.weather_data.empty:
-            w = session.weather_data
-            if "AirTemp" in w.columns and not w["AirTemp"].dropna().empty:
-                metrics["air_temp"] = round(float(w["AirTemp"].mean()), 1)
-            if "TrackTemp" in w.columns and not w["TrackTemp"].dropna().empty:
-                metrics["track_temp"] = round(float(w["TrackTemp"].mean()), 1)
-    except Exception as exc:
-        log.debug("Météo non disponible: %s", exc)
-
-    return metrics
+    if weather is not None and len(weather):
+        if "AirTemp" in weather and weather["AirTemp"].notna().any():
+            m["air"] = float(weather["AirTemp"].mean())
+        if "TrackTemp" in weather and weather["TrackTemp"].notna().any():
+            m["track"] = float(weather["TrackTemp"].mean())
+        if "Rainfall" in weather:
+            m["rain"] = bool(weather["Rainfall"].fillna(False).astype(bool).any())
+    return m
 
 
-# ── DataManager ──────────────────────────────────────────────────────────────
+def build_session(year: int, event: Event, code: str, raw_laps, raw_results, raw_weather,
+                  ff1_session=None) -> SessionData:
+    laps = normalize_laps(raw_laps)
+    if laps.empty:
+        raise DataUnavailable("Cette session ne contient aucun tour chronométré.")
+    drivers = build_drivers(raw_results, laps)
+    metrics = build_metrics(code, drivers, laps, raw_weather)
+    return SessionData(year, event, code, drivers, laps, metrics, _ff1=ff1_session)
 
-class DataManager(QObject):
-    """
-    Gestionnaire central des données FastF1.
-    Toutes les opérations d'E/S et réseau sont asynchrones.
-    """
 
-    schedule_ready = pyqtSignal(object)   # list[dict] ou list[str]
-    drivers_ready  = pyqtSignal(object)   # list[dict] avec code, nom, écurie, couleur
-    session_ready  = pyqtSignal(object)   # fastf1.core.Session
-    error          = pyqtSignal(str)
+# ── Service FastF1 ───────────────────────────────────────────────────────────
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._pool: QThreadPool = QThreadPool.globalInstance()
-        self._pool.setMaxThreadCount(3)
+class Service:
+    """Accès FastF1. Toutes les méthodes sont bloquantes : à appeler depuis un thread."""
 
-        # Cache : { (year, gp, session_type) -> fastf1.Session }
-        self._session_cache: dict[tuple, fastf1.core.Session] = {}
-        # Références fortes pour éviter la suppression GC prématurée
-        self._active_workers: set[_Worker] = set()
-
-    def _run_worker(self, fn, *args, on_result=None, on_error=None, **kwargs) -> _Worker:
-        """Lance un worker et conserve une référence active jusqu'à la fin."""
-        w = _Worker(fn, *args, **kwargs)
-        if on_result:
-            w.signals.result.connect(on_result)
-        if on_error:
-            w.signals.error.connect(on_error)
-
-        def _cleanup(*_):
-            self._active_workers.discard(w)
-
-        w.signals.result.connect(_cleanup)
-        w.signals.error.connect(_cleanup)
-        self._active_workers.add(w)
-        self._pool.start(w)
-        return w
-
-    # ── API publique ─────────────────────────────────────────────────────────
-
-    def fetch_schedule(self, year: int) -> None:
-        """Charge le calendrier d'une saison de façon asynchrone."""
-        self._run_worker(
-            self._load_schedule, year,
-            on_result=self.schedule_ready,
-            on_error=self.error
-        )
-
-    def fetch_drivers(self, year: int, gp: str, session_type: str = "R") -> None:
-        """Charge les pilotes participants pour un GP."""
-        self._run_worker(
-            self._load_drivers, year, gp, session_type,
-            on_result=self.drivers_ready,
-            on_error=self.error
-        )
-
-    def fetch_session(self, year: int, gp: str, session_type: str = "R") -> None:
-        """Charge une session complète avec métriques."""
-        key = (year, gp, session_type)
-        if key in self._session_cache:
-            log.debug("Session trouvée en cache mémoire: %s", key)
-            self.session_ready.emit(self._session_cache[key])
-            return
-
-        def _on_loaded(session):
-            self._session_cache[key] = session
-            self.session_ready.emit(session)
-
-        self._run_worker(
-            self._load_session, year, gp, session_type,
-            on_result=_on_loaded,
-            on_error=self.error
-        )
-
-    def get_cached_session(
-        self, year: int, gp: str, session_type: str = "R"
-    ) -> Optional[fastf1.core.Session]:
-        return self._session_cache.get((year, gp, session_type))
-
-    def clear_cache(self) -> None:
-        self._session_cache.clear()
-        log.info("Cache mémoire vidé")
-
-    # ── Workers internes ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _load_schedule(year: int) -> list[dict]:
-        log.info("Chargement du calendrier F1 %d…", year)
-        charts._ensure_season_constants(year)
-        schedule = None
-
-        # Tentative standard puis backend fastf1 direct
-        try:
-            schedule = fastf1.get_event_schedule(year, include_testing=False)
-        except Exception as exc:
-            log.warning("Échec get_event_schedule par défaut (%s), essai backend='fastf1'", exc)
+    def __init__(self, cache_dir: Optional[Path] = None, memory: int = 6):
+        import fastf1
+        self._ff1 = fastf1
+        if cache_dir:
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
             try:
-                schedule = fastf1.get_event_schedule(year, backend="fastf1", include_testing=False)
-            except Exception as exc2:
-                raise ValueError(
-                    f"Impossible de récupérer le calendrier pour la saison {year}. "
-                    "Vérifiez votre connexion internet."
-                )
+                fastf1.Cache.enable_cache(str(cache_dir))
+            except Exception as exc:                       # cache déjà activé
+                log.debug("Cache FastF1 : %s", exc)
+        self._lock = threading.Lock()                      # FastF1 n'aime pas les chargements parallèles
+        self._memory = memory
+        self._sessions: OrderedDict[tuple, SessionData] = OrderedDict()
+        self._schedules: dict[int, list[Event]] = {}
 
-        if schedule is None or schedule.empty:
-            raise ValueError(f"Aucune course trouvée pour la saison {year}.")
+    def schedule(self, year: int) -> list[Event]:
+        if year in self._schedules:
+            return self._schedules[year]
+        try:
+            with self._lock:
+                sched = self._ff1.get_event_schedule(year, include_testing=False)
+        except Exception as exc:
+            raise DataUnavailable(
+                f"Impossible de récupérer le calendrier {year}. Vérifie ta connexion internet.") from exc
 
         events = []
-        for _, row in schedule.iterrows():
-            rnd = row.get("RoundNumber")
-            rnd_num = int(rnd) if pd.notna(rnd) else 0
-            ev_name = str(row.get("EventName", "Grand Prix"))
-            events.append({
-                "round": rnd_num,
-                "name": ev_name,
-                "country": str(row.get("Country", "")),
-                "location": str(row.get("Location", "")),
-                "date": str(row.get("EventDate", ""))[:10],
-                "format": str(row.get("EventFormat", "conventional")),
-            })
-
-        log.info("%d GP chargés avec succès pour %d", len(events), year)
+        for _, r in sched.iterrows():
+            codes = []
+            for i in range(1, 6):
+                c = _NAME_TO_CODE.get(str(r.get(f"Session{i}", "")))
+                if c:
+                    codes.append(c)
+            if not codes:
+                codes = ["FP1", "FP2", "FP3", "Q", "R"]
+            events.append(Event(
+                round=int(r["RoundNumber"]), name=str(r["EventName"]),
+                country=str(r.get("Country", "")), location=str(r.get("Location", "")),
+                date=pd.Timestamp(r["EventDate"]).date(),
+                sessions=tuple(sorted(codes, key=SESSION_ORDER.index)),
+            ))
+        events = [e for e in events if e.round > 0]
+        self._schedules[year] = events
         return events
 
-    def _load_drivers(self, year: int, gp: str, session_type: str = "R") -> list[dict]:
-        """Extrait la liste détaillée des pilotes."""
-        key = (year, gp, session_type)
-        session = self._session_cache.get(key)
-        charts._ensure_season_constants(year)
+    def session(self, year: int, event: Event, code: str) -> SessionData:
+        key = (year, event.round, code)
+        if key in self._sessions:
+            self._sessions.move_to_end(key)
+            return self._sessions[key]
 
-        if session is None:
-            log.info("Chargement des informations pilotes pour %d %s %s", year, gp, session_type)
+        with self._lock:
             try:
-                session = fastf1.get_session(year, gp, session_type)
-                session.load(laps=False, telemetry=False, weather=False, messages=False)
+                s = self._ff1.get_session(year, event.round, code)
+                s.load(laps=True, telemetry=False, weather=True, messages=False)
+                laps = s.laps
             except Exception as exc:
-                log.warning("Erreur chargement session pilotes: %s", exc)
-                return []
-
-        drivers_list: list[dict] = []
-        for drv_id in session.drivers:
+                log.warning("Chargement %s : %s", key, exc)
+                raise DataUnavailable(
+                    "Les données de cette session ne sont pas disponibles. Si elle vient de se "
+                    "terminer, FastF1 peut mettre quelques heures à les publier.") from exc
             try:
-                drv = session.get_driver(drv_id)
-                code = str(drv.get("Abbreviation", drv_id))
-                name = str(drv.get("FullName", code))
-                team = str(drv.get("TeamName", "Écurie"))
-                color = charts.get_safe_driver_color(code, session)
-                drivers_list.append({
-                    "id": str(drv_id),
-                    "code": code,
-                    "name": name,
-                    "team": team,
-                    "color": color,
-                })
-            except Exception as exc:
-                log.debug("Erreur extraction pilote %s: %s", drv_id, exc)
-
-        log.info("%d pilotes configurés", len(drivers_list))
-        return drivers_list
-
-    @staticmethod
-    def _load_session(year: int, gp: str, session_type: str) -> fastf1.core.Session:
-        log.info("Chargement complet session %d %s [%s]", year, gp, session_type)
-        charts._ensure_season_constants(year)
-        sess = fastf1.get_session(year, gp, session_type)
-
-        try:
-            sess.load(laps=True, telemetry=True, weather=True, messages=False)
-        except Exception as exc:
-            log.warning("Chargement avec télémétrie échoué (%s), repli sur laps uniquement", exc)
+                results = s.results
+            except Exception:
+                results = None
             try:
-                sess.load(laps=True, telemetry=False, weather=False, messages=False)
-            except Exception as exc2:
-                raise ValueError(
-                    f"Données non disponibles pour cette session ({session_type}). "
-                    "Il est possible que la course n'ait pas encore eu lieu."
-                )
+                weather = s.weather_data
+            except Exception:
+                weather = None
+            sd = build_session(year, event, code, laps, results, weather, ff1_session=s)
 
-        # Calcul des métriques de session
-        sess.dashboard_metrics = extract_session_metrics(sess)
-        log.info("Session %s chargée avec succès", sess.event["EventName"])
-        return sess
+        self._sessions[key] = sd
+        while len(self._sessions) > self._memory:
+            self._sessions.popitem(last=False)
+        return sd
 
-    def _on_session_loaded(self, key: tuple, session: fastf1.core.Session) -> None:
-        self._session_cache[key] = session
-        self.session_ready.emit(session)
+    def drop(self, year: int, event: Event, code: str) -> None:
+        """Oublie la session en mémoire (le cache disque FastF1 est conservé)."""
+        self._sessions.pop((year, event.round, code), None)
+
+    def telemetry(self, sd: SessionData, codes: list[str]) -> dict[str, TelemetryLap]:
+        """Télémétrie du meilleur tour de chaque pilote (chargée à la demande seulement)."""
+        msg = ("La télémétrie de cette session n'est pas encore disponible. "
+               "Elle est publiée avec un délai après la fin de la session.")
+        with self._lock:
+            if sd._ff1 is None:
+                raise DataUnavailable(msg)
+            if not sd._tel_loaded:
+                try:
+                    sd._ff1.load(laps=True, telemetry=True, weather=False, messages=False)
+                    sd._tel_loaded = True
+                except Exception as exc:
+                    raise DataUnavailable(msg) from exc
+            for code in codes:
+                if code in sd._tel:
+                    continue
+                try:
+                    lap = sd._ff1.laps.pick_drivers(code).pick_fastest()
+                    car = lap.get_car_data().add_distance()
+                    t = (car["Time"] - car["Time"].iloc[0]).dt.total_seconds()
+                    df = pd.DataFrame({
+                        "dist": car["Distance"].to_numpy(), "speed": car["Speed"].to_numpy(),
+                        "throttle": car["Throttle"].to_numpy(),
+                        "brake": car["Brake"].astype(int).to_numpy(),
+                        "gear": car["nGear"].to_numpy(), "t": t.to_numpy(),
+                    })
+                    sd._tel[code] = TelemetryLap(code, float(lap["LapTime"].total_seconds()), df)
+                except Exception as exc:
+                    log.warning("Télémétrie %s : %s", code, exc)
+                    raise DataUnavailable(
+                        f"Pas de télémétrie exploitable pour {code} sur cette session.") from exc
+        return {c: sd._tel[c] for c in codes}

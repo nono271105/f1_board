@@ -1,117 +1,56 @@
-# F1 Dashboard
+# F1 Board
 
-Application desktop de visualisation de données Formula 1.
+Application de bureau pour explorer les données Formule 1 (2018 à aujourd'hui) : temps au tour, positions, stratégies pneus, rythme des écuries, télémétrie, écarts.
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue) ![PyQt5](https://img.shields.io/badge/PyQt5-5.15+-green) ![FastF1](https://img.shields.io/badge/FastF1-3.x-red)
-
----
-
-## Fonctionnalités
-
-- **7 visualisations télémétriques et stratégiques** :
-  - 🏎️ Distribution des temps au tour (violon + swarm par compound Pirelli)
-  - 📈 Évolution des positions en course (dynamique 20 à 22 pilotes)
-  - 🛞 Stratégie pneumatique (relais et gommes officielles)
-  - ⏱️ Comparaison du rythme des écuries (box plot avec médianes or)
-  - 📊 Progression des temps au tour par pilote
-  - ⚡ Comparaison de télémétrie des tours rapides (vitesse, accélérateur, frein)
-  - 🏁 Évolution de l'écart chronométrique au leader (Gap to leader)
-- **Bandeau de métriques de course en direct** : Vainqueur, tour le plus rapide, distance de course et météo de piste.
-- **Support des saisons 2018 à 2026+** avec compatibilité pour les nouvelles écuries (Audi, Cadillac).
-- **Sélecteur de type de session** : Course (GP), Qualifications (Q), Sprint (S), Shootout (SQ) et Essais libres (FP1/2/3).
-- **Barre d'outils interactive sombre** : Zoom rectangulaire, déplacement (pan), réinitialisation de la vue.
-- **Export haute résolution** : Sauvegarde en formats PNG (300 DPI), PDF ou SVG.
-- **Double cache haute performance** : Cache disque persistant FastF1 et cache mémoire applicatif.
-
----
-
-## Structure du projet
-
-```
-f1_board/
-├── main.py          # Point d'entrée — configure cache, logging, lance l'app
-├── gui.py           # Interface complète (fenêtre, sidebar, canvas, toolbar)
-├── data.py          # Couche données FastF1 + workers asynchrones
-├── charts.py        # Toutes les visualisations matplotlib
-├── requirements.txt
-├── README.md
-├── cache/           # Cache disque FastF1 (auto-créé)
-└── logs/            # Logs applicatifs (auto-créé)
-```
-
----
-
-## Installation
-
-### Prérequis
-
-- Python 3.10 ou supérieur
-- macOS, Linux ou Windows
-
-### Mise en place
+## Lancer
 
 ```bash
-# Cloner le dépôt
-git clone https://github.com/nono271105/f1_board.git
-cd f1_board
-
-# Créer un environnement virtuel
 python -m venv venv
-source venv/bin/activate      # macOS / Linux
-# ou
-venv\Scripts\activate         # Windows
-
-# Installer les dépendances
+source venv/bin/activate        # Windows : venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### Lancer l'application
-
-```bash
 python main.py
 ```
 
----
+Python 3.10 ou plus. Au démarrage, l'application ouvre la dernière course disputée.
+Le premier chargement d'une session télécharge les données (jusqu'à une minute),
+les suivants sont instantanés grâce au cache disque FastF1 (dossier `cache/`).
 
 ## Utilisation
 
-1. **Choisir une saison** dans le menu déroulant (2018–2026)
-2. **Sélectionner un Grand Prix** dans la liste — les pilotes se chargent automatiquement
-3. **Choisir une visualisation** dans le menu déroulant
-4. Pour *Progression pilotes* : cocher les pilotes souhaités dans la liste
-5. Cliquer sur **GÉNÉRER** pour afficher le graphique
-6. Cliquer sur **Exporter PNG** pour sauvegarder le graphique (PNG, PDF ou SVG)
+| Action                                       | Comment                                                                            |
+| -------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Changer de saison, de session, de Grand Prix | panneau de gauche                                                                  |
+| Changer d'analyse                            | onglets, ou touches 1 à 7                                                         |
+| Choisir les pilotes                          | grille de pilotes (une colonne par écurie), raccourcis Top 5, Top 10, Tous, Aucun |
+| Lire les valeurs                             | survoler le graphique                                                              |
+| Zoomer, déplacer                            | molette pour zoomer, glisser pour déplacer, bouton Zoom pour tracer un rectangle  |
+| Revenir à la vue d'ensemble                 | Réinitialiser                                                                     |
+| Exporter                                     | Exporter ou Ctrl+E (PNG 3x, PDF ou SVG vectoriel)                                  |
+| Recharger la session                         | F5 ou Ctrl+R                                                                       |
 
-> **Note** : le premier chargement d'une session peut prendre 30–60 secondes selon la connexion (téléchargement depuis l'API Ergast/FastF1). Les chargements suivants sont instantanés grâce au double cache.
+Les analyses réservées aux courses (positions, pneus, écarts) sont grisées pour les essais et les qualifications. Les courses pas encore disputées et les sessions absentes d'un week-end sont grisées aussi.
 
----
+## Structure
 
-## Dépendances
-
-| Package | Rôle |
-|---|---|
-| `PyQt5` | Framework UI |
-| `fastf1` | Données F1 (télémétrie, résultats, calendrier) |
-| `matplotlib` | Rendu des graphiques |
-| `seaborn` | Violin plot et box plot |
-| `pandas` | Manipulation des données tabulaires |
-| `numpy` | Calculs numériques |
-
----
-
-## Données et cache
-
-FastF1 télécharge ses données depuis l'API officielle F1 et Ergast. Le dossier `cache/` stocke ces données sur disque pour éviter de les re-télécharger.
-
-```bash
-# Vider le cache disque si nécessaire
-rm -rf cache/
+```
+main.py       point d'entrée, journalisation, cache
+gui.py        fenêtre principale, chargements en arrière-plan
+widgets.py    sélecteurs, liste des GP, grille de pilotes, vue graphique, export
+plots.py      les 7 analyses (pyqtgraph)
+data.py       accès FastF1 et normalisation (aucune dépendance à Qt)
+theme.py      palette, police, feuille de style
+tests/        données synthétiques et test de fumée
+assets/fonts  Titillium Web (licence SIL OFL)
 ```
 
-Le cache mémoire (dans `DataManager`) est vidé à chaque fermeture de l'application.
+## Tests
 
----
+```bash
+python tests/smoke.py
+```
 
-## Logs
+Lance la vraie fenêtre hors écran avec des données synthétiques au format FastF1, parcourt les sept analyses, vérifie les messages d'erreur et l'export, et écrit des captures dans `/tmp/f1_shots`.
 
-Les logs sont écrits dans `logs/f1_dashboard.log` et affichés dans la console. Niveau `DEBUG` sur fichier, `INFO` sur console.
+## Journal
+
+`logs/f1_board.log` (rotation automatique, 2 fichiers de 500 Ko maximum).

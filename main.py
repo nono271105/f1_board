@@ -1,69 +1,48 @@
-"""
-main.py — Point d'entrée de l'application F1 Dashboard
-"""
+"""main.py : point d'entrée de F1 Board."""
 
-import sys
 import logging
+import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# ── Configuration du cache FastF1 (avant tout appel fastf1) ───────────────────
-import fastf1
-_CACHE_DIR = Path(__file__).parent / "cache"
-_CACHE_DIR.mkdir(exist_ok=True)
-try:
-    fastf1.Cache.enable_cache(str(_CACHE_DIR))
-except Exception as exc:
-    # Mode fallback si enable_cache a été appelé
-    pass
-
-# ── Backend Matplotlib Qt5 ────────────────────────────────────────────────────
-import matplotlib
-matplotlib.use("Qt5Agg")
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-_LOG_DIR = Path(__file__).parent / "logs"
-_LOG_DIR.mkdir(exist_ok=True)
-
-_fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-
-_console = logging.StreamHandler(sys.stdout)
-_console.setLevel(logging.INFO)
-_console.setFormatter(_fmt)
-
-_file = logging.FileHandler(_LOG_DIR / "f1_dashboard.log", encoding="utf-8")
-_file.setLevel(logging.DEBUG)
-_file.setFormatter(_fmt)
-
-logging.getLogger().setLevel(logging.DEBUG)
-logging.getLogger().addHandler(_console)
-logging.getLogger().addHandler(_file)
-
-for _noisy in ("matplotlib", "matplotlib.font_manager", "fastf1", "urllib3", "requests"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
-
-log = logging.getLogger("main")
+BASE = Path(__file__).parent
 
 
-def main() -> None:
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtWidgets import QApplication
+def _setup_logging() -> None:
+    logs = BASE / "logs"
+    logs.mkdir(exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    file = RotatingFileHandler(logs / "f1_board.log", maxBytes=512_000, backupCount=2, encoding="utf-8")
+    file.setFormatter(fmt)
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[file, console])
+    for noisy in ("fastf1", "requests_cache", "urllib3", "matplotlib"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def make_service():
+    from data import Service
+    return Service(cache_dir=BASE / "cache")
+
+
+def main() -> int:
+    _setup_logging()
+    from PySide6.QtWidgets import QApplication
+
+    import theme
     from gui import MainWindow
 
-    # Support haute résolution (Retina / High-DPI)
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
-
-    log.info("Démarrage de F1 Dashboard Analytics")
     app = QApplication(sys.argv)
-    app.setApplicationName("F1 Dashboard")
-    app.setApplicationDisplayName("F1 Analytics Dashboard")
+    app.setApplicationName("F1 Board")
+    theme.load_fonts()
+    app.setFont(theme.font(10.5))
+    app.setStyleSheet(theme.STYLESHEET)
 
-    window = MainWindow()
+    window = MainWindow(make_service)     # FastF1 n'est importé qu'en arrière-plan
     window.show()
-
-    log.info("Interface F1 Dashboard affichée avec succès")
-    sys.exit(app.exec_())
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
