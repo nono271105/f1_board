@@ -41,7 +41,6 @@ def shot(win, name):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    theme.load_fonts()
     app.setFont(theme.font(10.5))
     app.setStyleSheet(theme.STYLESHEET)
     win = MainWindow(lambda: FakeService(fail_codes=("FP1",)))

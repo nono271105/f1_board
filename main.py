@@ -35,7 +35,6 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("F1 Board")
-    theme.load_fonts()
     app.setFont(theme.font(10.5))
     app.setStyleSheet(theme.STYLESHEET)
 

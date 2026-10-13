@@ -30,24 +30,13 @@ COMPOUNDS = {          # gommes Pirelli
     "UNKNOWN": ("#6d6e77", "Inconnue"),
 }
 
-FONT = "Titillium Web"
-_FALLBACK_FONT = "Helvetica Neue"
-_loaded = False
-
-
 def load_fonts() -> str:
-    global _loaded
-    families = []
-    for ttf in sorted((Path(__file__).parent / "assets" / "fonts").glob("*.ttf")):
-        fid = QFontDatabase.addApplicationFont(str(ttf))
-        if fid >= 0:
-            families += QFontDatabase.applicationFontFamilies(fid)
-    _loaded = FONT in families
-    return FONT if _loaded else _FALLBACK_FONT
+    """Conserve pour compatibilité : pas d'import de polices externes."""
+    return ""
 
 
 def font(size: float = 10, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    f = QFont(FONT if _loaded else _FALLBACK_FONT)
+    f = QFont()
     f.setPointSizeF(size)
     f.setWeight(weight)
     return f
